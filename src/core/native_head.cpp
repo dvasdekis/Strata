@@ -101,6 +101,7 @@ void set_native_embed(const NativeEmbed* e) { g_embed = e; }
 const NativeEmbed* native_embed() { return g_embed; }
 
 NativeEmbed::~NativeEmbed() {
+    if (dev_owned_) cudaFree(dev_owned_);
     if (host_) cudaFreeHost(host_);
     else if (dev_) cudaFree(const_cast<void*>(dev_));   // the VRAM fallback below
 }
@@ -114,7 +115,7 @@ bool NativeEmbed::load(const std::vector<std::string>& shards, int64_t n_embd, i
         const strata::TensorInfo* t = model.find("token_embd.weight", &at);
         const strata::GgufFile& gguf = model.shard(at);
         if (!t || t->shape.size() != 2 || t->shape[0] != (uint64_t) n_embd || t->shape[1] != (uint64_t) n_vocab ||
-            !strata::kernels::iq_supported((int) t->type) || n_embd % 256) {
+            !(strata::kernels::iq_supported((int) t->type) || t->type == 8) || n_embd % 256) {
             err = "native embedding: token_embd.weight is absent, of another shape, or of a type without a GPU "
                   "dequantizer";
             return false;
@@ -148,11 +149,24 @@ bool NativeEmbed::load(const std::vector<std::string>& shards, int64_t n_embd, i
         } else {
             std::memcpy(host_, gguf.tensor_data(*t), bytes_);
             void* d = nullptr;
-            if (cudaHostGetDevicePointer(&d, host_, 0) != cudaSuccess) {
-                err = "native embedding: no device alias for the mapped table";
-                return false;
+            if (cudaHostGetDevicePointer(&d, host_, 0) == cudaSuccess && d != nullptr) {
+                dev_ = d;
+            } else {
+                // On the Windows HIP stack hipHostGetDevicePointer hands back the host pointer, so the
+                // kernels would read over PCIe through a "device" address that is really host memory
+                // (and it may be non-null but unmapped). The table is only gathered from, so a real
+                // device copy is the portable answer: it costs its size in VRAM and reads far faster.
+                cudaGetLastError();
+                if (cudaMalloc(&d, bytes_) != cudaSuccess ||
+                    cudaMemcpy(d, gguf.tensor_data(*t), bytes_, cudaMemcpyHostToDevice) != cudaSuccess) {
+                    if (d) cudaFree(d);
+                    cudaGetLastError();
+                    err = "native embedding: no device alias for the mapped table, and no VRAM to copy it into";
+                    return false;
+                }
+                std::fprintf(stderr, "strata: native embedding: host mapping is unusable, kept in VRAM instead\n");
+                dev_ = d;
             }
-            dev_ = d;
         }
         type_ = (int) t->type;
         n_embd_ = n_embd;

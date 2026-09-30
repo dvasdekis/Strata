@@ -2086,7 +2086,6 @@ LoadStats load_experts_gguf(const std::string& gguf, uint8_t* dst, const strata:
     st.layers = (uint64_t) lay.n_layers;
     const auto t0 = std::chrono::steady_clock::now();
     std::atomic<int64_t> next{0};
-    std::atomic<bool> bad{false};
     auto worker = [&]() {
         // #230: `fread` on a `FILE*`, as load_experts_ranges (#89): MSVC's `std::ifstream::read` splits a request
         // into 4095-byte freads, which took this path to 0.02 GiB/s on a Windows install without experts.bin.

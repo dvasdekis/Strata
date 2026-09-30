@@ -54,6 +54,22 @@ __device__ __forceinline__ int2 get_int_from_table_16(const int& q4, const int8_
 #define ggml_cuda_dp4a(a, b, c) STRATA_DP4A((a), (b), (c))
 
 // ---------------------------------------------------------------- the dot products (vecdotq.cuh)
+// One Q8_0 block (32 values) against the q8_1 block the caller already selected.
+// qs sits 2 bytes into the block, so the int8 lane is loaded as aligned uint16s.
+__device__ __forceinline__ float vec_dot_q8_0_q8_1(const void* __restrict__ vbq, const block_q8_1* __restrict__ bq8_1,
+                                                   const int& kbx, const int&) {
+    const block_q8_0* bq8_0 = (const block_q8_0*) vbq + kbx;
+    const uint16_t* q16 = (const uint16_t*) bq8_0->qs;
+    int sumi = 0;
+#pragma unroll
+    for (int j = 0; j < QK8_0 / 4; ++j) {
+        const int u = (int) q16[2 * j] | ((int) q16[2 * j + 1] << 16);
+        const int v = get_int_b4(bq8_1->qs, j);
+        sumi = ggml_cuda_dp4a(u, v, sumi);
+    }
+    return (float) bq8_0->d * __low2float(bq8_1->ds) * (float) sumi;
+}
+
 __device__ __forceinline__ float vec_dot_q2_0_q8_1(const void* __restrict__ vbq, const block_q8_1* __restrict__ bq8_1,
                                                    const int& kbx, const int& iqs) {
     const block_q2_0* bq2_0 = (const block_q2_0*) vbq + kbx;
@@ -1128,6 +1144,17 @@ __device__ void dq_iq4_xs(const void* vx, int64_t ibs, dst_t* yy, int tid) {
         y[j + 16] = cvt<dst_t>(d * kvalues_iq4nl[q4[j] >> 4]);
     }
 }
+// Q8_0 (Unsloth token_embd): 256 values = 8 blocks of 32. ggml value is d * int8.
+template<typename dst_t>
+__device__ void dq_q8_0(const void* vx, int64_t ibs, dst_t* yy, int tid) {
+    const block_q8_0* x = (const block_q8_0*) vx + ibs * (QK_K / QK8_0);
+    const int b = tid / 4, part = tid % 4;
+    const float d = (float) x[b].d;
+    for (int j = 0; j < 8; ++j) {
+        const int i = part * 8 + j;
+        yy[b * QK8_0 + i] = cvt<dst_t>(d * (float) x[b].qs[i]);
+    }
+}
 template<typename dst_t>
 __device__ void dq_q2_0(const void* vx, int64_t ibs, dst_t* yy, int tid) {
     // one "superblock" = 256 values = 4 blocks of 64; thread tid writes 8 values
@@ -1382,14 +1409,14 @@ __global__ void embed_rows_kernel(int ty, const uint8_t* __restrict__ table, siz
 void iq_embed_rows(int t, const void* table, size_t row_bytes, const int32_t* tokens, int64_t n_tok, int64_t n_embd,
                    float* out, void* stream) {
     if (n_tok <= 0) return;
-    if (n_embd % 256 != 0 || !is_iq(t)) { std::fprintf(stderr, "iq_embed_rows: bad arguments\n"); std::exit(1); }
+    if (n_embd % 256 != 0 || !(is_iq(t) || t == 8)) { std::fprintf(stderr, "iq_embed_rows: bad arguments\n"); std::exit(1); }
     embed_rows_kernel<<<dim3((unsigned) (n_embd / 256), (unsigned) n_tok), 32, 0, (cudaStream_t) stream>>>(
         t, (const uint8_t*) table, row_bytes, tokens, n_embd, out);
     check("iq_embed_rows");
 }
 
 void iq_dequant_f32(int t, const void* src, int64_t n, float* dst, void* stream) {
-    if (n % 256 != 0 || !is_iq(t)) { std::fprintf(stderr, "iq_dequant_f32: bad arguments\n"); std::exit(1); }
+    if (n % 256 != 0 || !(is_iq(t) || t == 8)) { std::fprintf(stderr, "iq_dequant_f32: bad arguments\n"); std::exit(1); }
     dequant_flat_kernel<float><<<(unsigned) (n / 256), 32, 0, (cudaStream_t) stream>>>(t, src, dst);
     check("iq_dequant_f32");
 }
