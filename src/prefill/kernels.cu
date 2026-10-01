@@ -341,14 +341,17 @@ __global__ void __launch_bounds__(CB * RG) gdn_rec_cols_kernel(float* __restrict
     for (int r = 0; r < RPG; ++r) base[r * rs] = s[r];
 }
 // gdn_rec_cols_kernel with the next token's inputs (q/k rows, v, gate, beta) loaded into registers while this token
-// computes (software pipelining).  The same arithmetic in the same order: the same bits, and the same CB-column split.
+// computes (software pipelining). Double-buffered shared memory (sk, sq) and split reduction buffers (red_kv, red_o)
+// reduce synchronization barriers from 5 down to 2 __syncthreads() per token.
+// The same arithmetic in the same order: the same bits, and the same CB-column split.
 // STRATA_GDN_PIPELINE=0: gdn_rec_cols_kernel.
 __global__ void __launch_bounds__(CB * RG) gdn_rec_cols_pipe_kernel(float* __restrict__ state, const float* __restrict__ h,
                                                                       const float* __restrict__ gate,
                                                                       const float* __restrict__ beta,
                                                                       float* __restrict__ oc_out, int64_t T) {
     constexpr int NT = CB * RG, LPT = S / NT;   // threads, q/k rows loaded per thread
-    __shared__ float sk[S], sq[S], red[RG][CB];
+    __shared__ float sk[2][S], sq[2][S];
+    __shared__ float red_kv[RG][CB], red_o[RG][CB];
     const int head = blockIdx.x / NCB, cb = blockIdx.x % NCB;
     const int c = threadIdx.x, rg = threadIdx.y, tid = rg * CB + c, col = cb * CB + c;
     const int qh = head % HK;
@@ -366,35 +369,46 @@ __global__ void __launch_bounds__(CB * RG) gdn_rec_cols_pipe_kernel(float* __res
         ng = gate[t * HV + head];
         nb = beta[t * HV + head];
     };
-    if (T > 0) fetch(0);
+    if (T > 0) {
+        fetch(0);
+#pragma unroll
+        for (int u = 0; u < LPT; ++u) { sq[0][tid + u * NT] = nq[u]; sk[0][tid + u * NT] = nk[u]; }
+    }
+    float cv = nv, cg = ng, cbt = nb;
+    if (T > 1) fetch(1);
+    __syncthreads();   // initial: buffer 0 ready
+
     for (int64_t t = 0; t < T; ++t) {
-        float cq[LPT], ck[LPT];
-#pragma unroll
-        for (int u = 0; u < LPT; ++u) { cq[u] = nq[u]; ck[u] = nk[u]; }
-        const float cv = nv, cg = ng, cbt = nb;
-        __syncthreads();
-#pragma unroll
-        for (int u = 0; u < LPT; ++u) { sq[tid + u * NT] = cq[u]; sk[tid + u * NT] = ck[u]; }
-        __syncthreads();
-        if (t + 1 < T) fetch(t + 1);
+        const int cur = (int) (t & 1);
+        const int nxt = 1 - cur;
         const float g = __expf(cg);
         float kv = 0.0f;
 #pragma unroll
-        for (int r = 0; r < RPG; ++r) kv = fmaf(s[r], sk[rg * RPG + r], kv);
-        red[rg][c] = kv;
-        __syncthreads();
-        const float kv_col = red[0][c] + red[1][c] + red[2][c] + red[3][c];
+        for (int r = 0; r < RPG; ++r) kv = fmaf(s[r], sk[cur][rg * RPG + r], kv);
+        red_kv[rg][c] = kv;
+
+        __syncthreads();   // barrier 1: red_kv published across row-groups
+
+        const float kv_col = red_kv[0][c] + red_kv[1][c] + red_kv[2][c] + red_kv[3][c];
         const float delta = (cv - g * kv_col) * cbt;
         float o = 0.0f;
 #pragma unroll
         for (int r = 0; r < RPG; ++r) {
-            s[r] = fmaf(g, s[r], sk[rg * RPG + r] * delta);
-            o = fmaf(s[r], sq[rg * RPG + r], o);
+            s[r] = fmaf(g, s[r], sk[cur][rg * RPG + r] * delta);
+            o = fmaf(s[r], sq[cur][rg * RPG + r], o);
         }
-        __syncthreads();
-        red[rg][c] = o;
-        __syncthreads();
-        if (rg == 0) oc_out[t * HV * S + head * S + col] = (red[0][c] + red[1][c] + red[2][c] + red[3][c]) * rsqrtf((float) S);
+        red_o[rg][c] = o;
+
+        if (t + 1 < T) {
+#pragma unroll
+            for (int u = 0; u < LPT; ++u) { sq[nxt][tid + u * NT] = nq[u]; sk[nxt][tid + u * NT] = nk[u]; }
+        }
+
+        __syncthreads();   // barrier 2: red_o published for oc_out, next sq/sk buffer ready for t+1
+
+        if (rg == 0) oc_out[t * HV * S + head * S + col] = (red_o[0][c] + red_o[1][c] + red_o[2][c] + red_o[3][c]) * rsqrtf((float) S);
+        cv = nv; cg = ng; cbt = nb;
+        if (t + 2 < T) fetch(t + 2);
     }
 #pragma unroll
     for (int r = 0; r < RPG; ++r) base[r * rs] = s[r];
