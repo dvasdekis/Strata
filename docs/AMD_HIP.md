@@ -290,6 +290,25 @@ Two consequences, both handled in the tree rather than papered over:
 documented Linux exclusions for the same reason). `hip_prefill_hipblaslt_gemm` skips: no gfx1201
 hipBLASLt table ships.
 
+### Windows Speed Optimizations (`amdwin-integration`)
+
+1. **Large Page Allocations (`SeLockMemoryPrivilege`):**
+   - The ~25 GB MoE expert arena requires over 6.5 million 4 KB page table entries, incurring frequent TLB walks across Zen 4's 2,048-entry L2 TLB during CPU expert routing.
+   - Script [`tools/windows/enable_large_pages.ps1`](file:///c:/code/dvasdekis/Strata/tools/windows/enable_large_pages.ps1) grants `SeLockMemoryPrivilege` on Windows, allowing Strata to allocate contiguous 2 MB pages via `VirtualAlloc(..., MEM_LARGE_PAGES)`. This reduces page entries to ~12,800 and stabilizes host memory access.
+2. **VRAM Reserve Default Tuning:**
+   - On Windows HIP, `vram_reserve_mib` defaults to 512 MiB when `kPostCacheMib` (192 MiB) is active, freeing ~500 MiB of idle headroom for hundreds of additional GPU expert cache slots.
+3. **PCIe DMA Streaming (`--pcie-mode auto`):**
+   - Because `hipHostGetDevicePointer` does not return a distinct GPU address space on Windows, `--pcie-mode auto` on Windows HIP is mapped directly to Mode 0 (DMA streaming via `cudaMemcpyAsync`), avoiding driver faults.
+4. **GDN Recurrence 2-Barrier Pipeline:**
+   - In [`src/prefill/kernels.cu`](file:///c:/code/dvasdekis/Strata/src/prefill/kernels.cu), `gdn_rec_cols_pipe_kernel` double-buffers shared memory state (`sk`, `sq`) and splits reduction buffers (`red_kv`, `red_o`).
+   - Intra-token block synchronization barriers are reduced from 5 down to 2 `__syncthreads()` per token (a 60% barrier reduction), accelerating prompt recurrence without affecting numerical results.
+5. **Warp-Coalesced Dequantization:**
+   - In [`src/kernels/cuda/dequant_bf16.cu`](file:///c:/code/dvasdekis/Strata/src/kernels/cuda/dequant_bf16.cu), `dequant_kernel` maps 1 warp (32 threads) per 32-element group rather than 1 thread per group.
+   - Loops are eliminated across all supported types (Q2_0, Q4_0, Q5_0, Q8_0, Q3_K, Q4_K, Q5_K, Q6_K, IQ4_NL, IQ4_XS), and stores are transformed into 100% coalesced 64-byte/128-byte transactions per warp.
+6. **hipBLAS vs hipBLASLt Stability on RDNA4 (`gfx1201`):**
+   - On Windows ROCm 10.2 / gfx1201, runtime dispatch inside `hipblaslt.dll` triggers launch failures (error 719) and high dispatch latency on small batch sizes ($T \le 64$).
+   - Standard hipBLAS (`hipblasGemmEx`) executes pre-compiled Tensile kernels stably at ~42 tok/s prompt prefill on short/medium prompts and is the recommended configuration on Windows.
+
 ## Tuning table
 
 A hipBLASLt table holds solution ids that are valid only for one GPU architecture and one hipBLASLt version, so it
