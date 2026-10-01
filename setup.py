@@ -250,6 +250,17 @@ def page_file_gb():
     return max(0.0, (m.ullTotalPageFile - m.ullTotalPhys) / 2**30)
 
 
+def large_pages_enabled():
+    """Whether SeLockMemoryPrivilege is held on Windows (enables 2 MB large pages in VirtualAlloc)."""
+    if not WIN:
+        return True
+    try:
+        out = subprocess.run(["whoami", "/priv"], capture_output=True, text=True, timeout=5).stdout
+        return "SeLockMemoryPrivilege" in out
+    except Exception:
+        return False
+
+
 def cpu_info():
     """(name, avx2, avx512): avx512 means everything Strata's fast AVX-512 kernels use (F, BW, VL, VNNI, VBMI),
     the same test the engine makes (cpu_avx512_ok), not just AVX-512F."""
@@ -2356,6 +2367,10 @@ def main() -> int:
         warn(f"Windows' page file is {pf:.1f} GB: the graphics card's memory needs room there too (issue #60), so "
              "the model may not start or may use less VRAM. Set it to \"System managed\": System > About > "
              "Advanced system settings > Performance > Advanced > Virtual memory")
+    if WIN and not large_pages_enabled():
+        say("  Tip: 'Lock pages in memory' privilege (SeLockMemoryPrivilege) is not set on this account.")
+        say("       Enabling 2 MB large pages eliminates TLB thrashing on the 25 GB expert arena,")
+        say("       boosting CPU expert decode speed. Run: .\\tools\\windows\\enable_large_pages.ps1")
     ok(f"CPU: {cpu} ({'AVX-512' if avx512 else 'AVX2' if avx2 else 'no AVX2'})")
     if not avx2:
         fail("this CPU has no AVX2; Strata needs at least AVX2")

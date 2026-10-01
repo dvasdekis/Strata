@@ -84,6 +84,10 @@ START-HERE.bat --backend hip
   reporting a stale error as before.
 - **hipBLASLt tuning table:** only a table for this card's arch AND the installed hipBLASLt version is
   used; otherwise plain hipBLAS (slower prompts, same answers). None ships for gfx1200/gfx1201 yet.
+- **Large pages (2 MB):** On Windows, allocating the 25 GB expert arena with 2 MB large pages requires
+  `SeLockMemoryPrivilege` ('Lock pages in memory'). Without it, Windows falls back to 4 KB pages, causing
+  frequent TLB page walks on DDR5. Run `tools/windows/enable_large_pages.ps1` as Administrator (or configure
+  in `secpol.msc`), then sign out and back in to enable.
 - **Limits for now:** one GPU, no images, no calibration. The Monitor shows no GPU statistics.
 
 Measured on an RX 9070 XT (gfx1201, 16 GB) with ROCm 10.2.0: Coder IQ1_M at 32K context loads
@@ -154,17 +158,18 @@ build-hip/strata --serve \
   --ple-gguf /path/to/Qwen3.8-Flash-Next-GSQ-RCO-IQ3_XXS-00002-of-00002.gguf \
   --mmap-experts --expert-profile data/expert-profile.bin --expert-cache auto \
   --prefill 512 --spec 4 --spec-min-p 0.5 --mtp mtp/rt \
-  --max-context 4096 --kv int8 --pool-workers 15 \
-  --adapt-every 0 --pcie-frac 0 --vram-reserve-mib 1024
+  --max-context 4096 --kv int8 \
+  --adapt-every 0 --pcie-frac 0 --vram-reserve-mib 512
 ```
 
 `--serve` is the engine's internal token protocol. For a browser or OpenAI API,
 put these args in the `args` array of the [server JSON example](ORCA.md#local-server),
 set `exe` to `build-hip/strata`, and use the matching pack's `tokenizer` directory.
 Launch with `.venv/bin/python -m serve.server --engine strata --config strata-hip.json --port 8080`.
-The worker count above was used on a 16-core CPU; measure it for your CPU.
-The 4K context is a smoke-test starting point, not a model limit. The expert cache
-sizes itself automatically and leaves 1 GiB of VRAM headroom.
+Omit `--pool-workers` so the engine binds one worker per physical CPU core (avoiding SMT contention).
+The 4K context is a smoke-test starting point, not a model limit. Sizing with `--vram-reserve-mib 512`
+reclaims ~500 MiB of idle headroom into extra expert cache slots now that `kPostCacheMib` (192) protects
+post-cache buffers.
 
 The installer supports this backend (see "Install with setup" above). The vision helper is NVIDIA-only for now.
 Setup installs one AMD card, or several with `--gpus` (the engine's layer split; see RDNA4 below).
