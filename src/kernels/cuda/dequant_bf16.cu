@@ -38,46 +38,42 @@ __device__ __forceinline__ void scale_min_k4(int j, const uint8_t* q, int& d, in
 }
 
 // One 32-element group `g` (row-major over the whole slice); `out` points at that group's 32 outputs.
+// Thread `lane` in the warp dequantizes element `lane` of the group, achieving 100% coalesced global writes.
 template <int TYPE, typename T>
-__device__ __forceinline__ void group32(const uint8_t* row_blocks, int gi_in_row, T* out) {
+__device__ __forceinline__ void group32(const uint8_t* row_blocks, int gi_in_row, int lane, T* out) {
     if constexpr (TYPE == 42) {                                   // Q2_0: 64 per block of 18 B
         const uint8_t* b = row_blocks + (size_t) (gi_in_row / 2) * 18;
         const float d = h2f(b);
-        const int e0 = (gi_in_row % 2) * 32;
-#pragma unroll
-        for (int j = 0; j < 32; ++j) {
-            const int e = e0 + j;
-            const int q = (b[2 + e / 4] >> ((e % 4) * 2)) & 3;
-            put(out, j, (float) (q - 1) * d);
-        }
+        const int e = (gi_in_row % 2) * 32 + lane;
+        const int q = (b[2 + e / 4] >> ((e % 4) * 2)) & 3;
+        put(out, lane, (float) (q - 1) * d);
     } else if constexpr (TYPE == 2) {                              // Q4_0
         const uint8_t* b = row_blocks + (size_t) gi_in_row * 18;
         const float d = h2f(b);
-        for (int j = 0; j < 16; ++j) {
-            put(out, j, (float) ((b[2 + j] & 0x0F) - 8) * d);
-            put(out, j + 16, (float) ((b[2 + j] >> 4) - 8) * d);
-        }
+        const int j = lane & 15;
+        const uint8_t byte_val = b[2 + j];
+        const int nib = (lane < 16) ? (byte_val & 0x0F) : (byte_val >> 4);
+        put(out, lane, (float) (nib - 8) * d);
     } else if constexpr (TYPE == 6) {                              // Q5_0
         const uint8_t* b = row_blocks + (size_t) gi_in_row * 22;
         const float d = h2f(b);
         const uint32_t qh = (uint32_t) b[2] | ((uint32_t) b[3] << 8) | ((uint32_t) b[4] << 16) | ((uint32_t) b[5] << 24);
-        for (int j = 0; j < 16; ++j) {
-            const int xh0 = ((qh >> j) << 4) & 0x10;
-            const int xh1 = (qh >> (j + 12)) & 0x10;
-            put(out, j, (float) (((b[6 + j] & 0x0F) | xh0) - 16) * d);
-            put(out, j + 16, (float) (((b[6 + j] >> 4) | xh1) - 16) * d);
-        }
+        const int j = lane & 15;
+        const uint8_t byte_val = b[6 + j];
+        const int xh = (lane < 16) ? (((qh >> j) << 4) & 0x10) : ((qh >> (j + 12)) & 0x10);
+        const int nib = (lane < 16) ? (byte_val & 0x0F) : (byte_val >> 4);
+        put(out, lane, (float) (((nib | xh) - 16)) * d);
     } else if constexpr (TYPE == 8) {                              // Q8_0
         const uint8_t* b = row_blocks + (size_t) gi_in_row * 34;
         const float d = h2f(b);
-        for (int j = 0; j < 32; ++j) put(out, j, (float) (int8_t) b[2 + j] * d);
+        put(out, lane, (float) (int8_t) b[2 + lane] * d);
     } else if constexpr (TYPE == 20) {                             // IQ4_NL
         const uint8_t* b = row_blocks + (size_t) gi_in_row * 18;
         const float d = h2f(b);
-        for (int j = 0; j < 16; ++j) {
-            put(out, j, d * (float) kv_iq4nl[b[2 + j] & 0xf]);
-            put(out, j + 16, d * (float) kv_iq4nl[b[2 + j] >> 4]);
-        }
+        const int j = lane & 15;
+        const uint8_t byte_val = b[2 + j];
+        const int idx = (lane < 16) ? (byte_val & 0xf) : (byte_val >> 4);
+        put(out, lane, d * (float) kv_iq4nl[idx]);
     } else if constexpr (TYPE == 11) {                             // Q3_K: hmask[32] qs[64] scales[12] d
         const uint8_t* b = row_blocks + (size_t) (gi_in_row / 8) * 110;
         const int gi = gi_in_row % 8, n = gi / 4, jj = gi % 4;
@@ -95,11 +91,9 @@ __device__ __forceinline__ void group32(const uint8_t* row_blocks, int gi_in_row
         const int8_t* scales = reinterpret_cast<const int8_t*>(aux);
         const int shift = 2 * jj;
         const uint8_t m = (uint8_t) (1u << (n * 4 + jj));
-        for (int t = 0; t < 32; ++t) {
-            const int is = n * 8 + jj * 2 + (t >= 16 ? 1 : 0);
-            const float dl = d_all * (float) (scales[is] - 32);
-            put(out, t, dl * (float) ((int) ((q[t] >> shift) & 3) - ((hm[t] & m) ? 0 : 4)));
-        }
+        const int is = n * 8 + jj * 2 + (lane >= 16 ? 1 : 0);
+        const float dl = d_all * (float) (scales[is] - 32);
+        put(out, lane, dl * (float) ((int) ((q[lane] >> shift) & 3) - ((hm[lane] & m) ? 0 : 4)));
     } else if constexpr (TYPE == 12) {                             // Q4_K: d dmin scales[12] qs[128]
         const uint8_t* b = row_blocks + (size_t) (gi_in_row / 8) * 144;
         const int gi = gi_in_row % 8, j64 = gi / 2, hi = gi % 2;
@@ -108,7 +102,7 @@ __device__ __forceinline__ void group32(const uint8_t* row_blocks, int gi_in_row
         scale_min_k4(gi, b + 4, sc, m);
         const float d1 = d * (float) sc, m1 = dmin * (float) m;
         const uint8_t* q = b + 16 + 32 * j64;
-        for (int l = 0; l < 32; ++l) put(out, l, d1 * (float) (hi ? (q[l] >> 4) : (q[l] & 0xF)) - m1);
+        put(out, lane, d1 * (float) (hi ? (q[lane] >> 4) : (q[lane] & 0xF)) - m1);
     } else if constexpr (TYPE == 13) {                             // Q5_K: d dmin scales[12] qh[32] qs[128]
         const uint8_t* b = row_blocks + (size_t) (gi_in_row / 8) * 176;
         const int gi = gi_in_row % 8, j64 = gi / 2, hi = gi % 2;
@@ -119,10 +113,8 @@ __device__ __forceinline__ void group32(const uint8_t* row_blocks, int gi_in_row
         const uint8_t* qh = b + 16;
         const uint8_t* ql = b + 48 + 32 * j64;
         const uint8_t u = (uint8_t) (1u << (2 * j64 + hi));
-        for (int l = 0; l < 32; ++l) {
-            const int nib = hi ? (ql[l] >> 4) : (ql[l] & 0xF);
-            put(out, l, d1 * (float) (nib + ((qh[l] & u) ? 16 : 0)) - m1);
-        }
+        const int nib = hi ? (ql[lane] >> 4) : (ql[lane] & 0xF);
+        put(out, lane, d1 * (float) (nib + ((qh[lane] & u) ? 16 : 0)) - m1);
     } else if constexpr (TYPE == 14) {                             // Q6_K: ql[128] qh[64] scales[16] d
         const uint8_t* b = row_blocks + (size_t) (gi_in_row / 8) * 210;
         const int gi = gi_in_row % 8, n = gi / 4, qu = gi % 4;
@@ -130,15 +122,13 @@ __device__ __forceinline__ void group32(const uint8_t* row_blocks, int gi_in_row
         const uint8_t* qh = b + 128 + 32 * n;
         const int8_t* sc = reinterpret_cast<const int8_t*>(b + 192) + 8 * n;
         const float d = h2f(b + 208);
-        for (int l = 0; l < 32; ++l) {
-            const int is = l / 16;
-            int q;
-            if (qu == 0) q = (ql[l] & 0xF) | (((qh[l] >> 0) & 3) << 4);
-            else if (qu == 1) q = (ql[l + 32] & 0xF) | (((qh[l] >> 2) & 3) << 4);
-            else if (qu == 2) q = (ql[l] >> 4) | (((qh[l] >> 4) & 3) << 4);
-            else q = (ql[l + 32] >> 4) | (((qh[l] >> 6) & 3) << 4);
-            put(out, l, d * (float) sc[is + 2 * qu] * (float) (q - 32));
-        }
+        const int is = lane / 16;
+        int q;
+        if (qu == 0) q = (ql[lane] & 0xF) | (((qh[lane] >> 0) & 3) << 4);
+        else if (qu == 1) q = (ql[lane + 32] & 0xF) | (((qh[lane] >> 2) & 3) << 4);
+        else if (qu == 2) q = (ql[lane] >> 4) | (((qh[lane] >> 4) & 3) << 4);
+        else q = (ql[lane + 32] >> 4) | (((qh[lane] >> 6) & 3) << 4);
+        put(out, lane, d * (float) sc[is + 2 * qu] * (float) (q - 32));
     } else if constexpr (TYPE == 23) {                             // IQ4_XS: d scales_h scales_l[4] qs[128]
         const uint8_t* b = row_blocks + (size_t) (gi_in_row / 8) * 136;
         const int ib = gi_in_row % 8;
@@ -147,20 +137,22 @@ __device__ __forceinline__ void group32(const uint8_t* row_blocks, int gi_in_row
         const int ls = ((b[4 + ib / 2] >> (4 * (ib % 2))) & 0xf) | (((scales_h >> (2 * ib)) & 3) << 4);
         const float dl = d * (float) (ls - 32);
         const uint8_t* qs = b + 8 + 16 * ib;
-        for (int j = 0; j < 16; ++j) {
-            put(out, j, dl * (float) kv_iq4nl[qs[j] & 0xf]);
-            put(out, j + 16, dl * (float) kv_iq4nl[qs[j] >> 4]);
-        }
+        const int j = lane & 15;
+        const uint8_t byte_val = qs[j];
+        const int idx = (lane < 16) ? (byte_val & 0xf) : (byte_val >> 4);
+        put(out, lane, dl * (float) kv_iq4nl[idx]);
     }
 }
 
 template <int TYPE, typename T>
 __global__ void dequant_kernel(const uint8_t* __restrict__ blocks, int64_t row_bytes, int64_t row0, int64_t rows,
                                int64_t groups_per_row, T* __restrict__ out) {
-    const int64_t g = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+    const int64_t global_tid = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+    const int64_t g = global_tid >> 5;
     if (g >= rows * groups_per_row) return;
+    const int lane = threadIdx.x & 31;
     const int64_t r = g / groups_per_row, gi = g % groups_per_row;
-    group32<TYPE>(blocks + (row0 + r) * row_bytes, (int) gi, out + r * groups_per_row * 32 + gi * 32);
+    group32<TYPE>(blocks + (row0 + r) * row_bytes, (int) gi, lane, out + r * groups_per_row * 32 + gi * 32);
 }
 
 bool geometry(int type, int& block_elems, int& block_bytes) {
@@ -188,7 +180,8 @@ void launch(int type, const void* blocks, int64_t row0, int64_t rows, int64_t co
         std::exit(1);
     }
     const int64_t row_bytes = cols / be * bb, gpr = cols / 32, total = rows * gpr;
-    const unsigned grid = (unsigned) ((total + 255) / 256);
+    // Each 256-thread block processes 8 groups (1 warp of 32 threads per 32-element group)
+    const unsigned grid = (unsigned) ((total + 7) / 8);
     const uint8_t* p = (const uint8_t*) blocks;
     cudaStream_t st = (cudaStream_t) stream;
 #define STRATA_DQ(TY) dequant_kernel<TY, T><<<grid, 256, 0, st>>>(p, row_bytes, row0, rows, gpr, out); break
