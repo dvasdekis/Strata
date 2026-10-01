@@ -956,6 +956,24 @@ double probe_pcie_h2d_gbps() {
     return bw;
 }
 
+int resolve_pcie_mode(const std::string& mode) {
+    if (mode == "dma") return 0;
+#if defined(_WIN32) && (defined(STRATA_USE_HIP) || defined(__HIPCC__))
+    // Windows HIP: hipHostGetDevicePointer returns the host virtual address, so device kernels
+    // cannot dereference host pointers directly (tests/hip/mapped_alias.cpp). Direct and copy
+    // kernel modes require a distinct device virtual address. Auto therefore maps to
+    // host-to-device DMA streaming (mode 0) using pinned host memory.
+    if (mode == "direct" || mode == "kernel") {
+        std::fprintf(stderr, "strata: note: --pcie-mode %s is not supported on Windows HIP (no host pointer device alias); using dma\n",
+                     mode.c_str());
+    }
+    return 0;
+#else
+    if (mode == "direct") return 1;
+    return 2;
+#endif
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -3956,7 +3974,7 @@ int main(int argc, char** argv) {
             split_drive.plan[st] = stage_ver(st).plan_sink();
             if (st > 0) {
                 stage_ver(st).set_split(o.spec_split);
-                stage_ver(st).set_pcie_mode(o.pcie_mode == "dma" ? 0 : o.pcie_mode == "direct" ? 1 : 2);
+                stage_ver(st).set_pcie_mode(resolve_pcie_mode(o.pcie_mode));
             }
         }
         // the pool the verify windows call: with a layer split, the wrapper that routes each layer to its stage
@@ -3968,7 +3986,8 @@ int main(int argc, char** argv) {
         // cudaMemcpyAsync + cudaLaunchHostFunc inside a verify window while the GPU spins on the flag they raise;
         // issue #31's thread dumps show the host stuck in that cudaMemcpyAsync on a driver lock for good.  The copy
         // kernel needs no host CUDA call there, and costs ~1-3% decode on IQ3_S (45.3 -> 44.8 tok/s, 8 requests).
-        ver.set_pcie_mode(o.pcie_mode == "dma" ? 0 : o.pcie_mode == "direct" ? 1 : 2);
+        // On Windows HIP, DMA is used instead because device kernels cannot read mapped host memory.
+        ver.set_pcie_mode(resolve_pcie_mode(o.pcie_mode));
         std::vector<int64_t> cur;
         // ---- the conversation cache (see ConvCheckpoint).  `live` is what the session holds right now: the tokens
         // it has consumed, so a request that starts with exactly them continues without any copy.  `checks` are the
@@ -5697,7 +5716,8 @@ int main(int argc, char** argv) {
         // cudaMemcpyAsync + cudaLaunchHostFunc inside a verify window while the GPU spins on the flag they raise;
         // issue #31's thread dumps show the host stuck in that cudaMemcpyAsync on a driver lock for good.  The copy
         // kernel needs no host CUDA call there, and costs ~1-3% decode on IQ3_S (45.3 -> 44.8 tok/s, 8 requests).
-        ver.set_pcie_mode(o.pcie_mode == "dma" ? 0 : o.pcie_mode == "direct" ? 1 : 2);
+        // On Windows HIP, DMA is used instead because device kernels cannot read mapped host memory.
+        ver.set_pcie_mode(resolve_pcie_mode(o.pcie_mode));
         drive.d.plan = ver.plan_sink();
         drive.d.pcie_num = (int) (o.pcie_frac * 256.0 + 0.5);
         if (drive.d.pcie_num < 0) drive.d.pcie_num = 0;

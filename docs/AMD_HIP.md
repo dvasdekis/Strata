@@ -88,6 +88,9 @@ START-HERE.bat --backend hip
   `SeLockMemoryPrivilege` ('Lock pages in memory'). Without it, Windows falls back to 4 KB pages, causing
   frequent TLB page walks on DDR5. Run `tools/windows/enable_large_pages.ps1` as Administrator (or configure
   in `secpol.msc`), then sign out and back in to enable.
+- **PCIe expert offloading (DMA mode):** On Windows HIP, `hipHostGetDevicePointer` does not return a
+  device-mapped address for host memory. The engine automatically maps `--pcie-mode auto` to host-to-device
+  DMA streaming (`--pcie-mode dma`), safely enabling hybrid PCIe expert offloading without requiring `--pcie-frac 0`.
 - **Limits for now:** one GPU, no images, no calibration. The Monitor shows no GPU statistics.
 
 Measured on an RX 9070 XT (gfx1201, 16 GB) with ROCm 10.2.0: Coder IQ1_M at 32K context loads
@@ -159,7 +162,7 @@ build-hip/strata --serve \
   --mmap-experts --expert-profile data/expert-profile.bin --expert-cache auto \
   --prefill 512 --spec 4 --spec-min-p 0.5 --mtp mtp/rt \
   --max-context 4096 --kv int8 \
-  --adapt-every 0 --pcie-frac 0 --vram-reserve-mib 512
+  --adapt-every 0 --vram-reserve-mib 512
 ```
 
 `--serve` is the engine's internal token protocol. For a browser or OpenAI API,
